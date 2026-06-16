@@ -630,7 +630,8 @@ class TimeSpacePlotWidget(QWidget):
             self._valid_block_count += 1
             return
 
-        self._display_buffer[:, :-self._display_block_width] = self._display_buffer[:, self._display_block_width :]
+        shifted = self._display_buffer[:, self._display_block_width :].copy()
+        self._display_buffer[:, :-self._display_block_width] = shifted
         self._display_buffer[:, -self._display_block_width :] = display_block
 
     def _schedule_display_update(self):

@@ -8,7 +8,13 @@ from pathlib import Path
 SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC_DIR))
 
-from config import ClockSource, DataSource, calculate_fiber_length, validate_point_num
+from config import (
+    ClockSource,
+    DataSource,
+    calculate_fiber_length,
+    get_upload_sample_rate_hz,
+    validate_point_num,
+)
 
 
 class ConfigValidationTests(unittest.TestCase):
@@ -18,8 +24,14 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertEqual(int(ClockSource.EXTERNAL), 0)
         self.assertEqual(int(ClockSource.INTERNAL), 1)
 
-    def test_raw_uses_256_point_alignment(self):
-        self.assertEqual(validate_point_num(20480, 2, DataSource.raw), (True, ""))
+    def test_raw_single_channel_uses_256_point_alignment(self):
+        self.assertEqual(validate_point_num(131072, 1, DataSource.raw), (True, ""))
+        self.assertFalse(validate_point_num(131073, 1, DataSource.raw)[0])
+        self.assertFalse(validate_point_num(20481, 1, DataSource.raw)[0])
+
+    def test_raw_dual_channel_uses_128_point_alignment(self):
+        self.assertEqual(validate_point_num(65536, 2, DataSource.raw), (True, ""))
+        self.assertFalse(validate_point_num(65664, 2, DataSource.raw)[0])
         self.assertFalse(validate_point_num(20481, 2, DataSource.raw)[0])
 
     def test_dual_demodulation_uses_128_point_alignment(self):
@@ -33,6 +45,12 @@ class ConfigValidationTests(unittest.TestCase):
     def test_upload_rate_controls_spatial_distance(self):
         self.assertEqual(calculate_fiber_length(1000, 1, DataSource.PHASE, 1), 400.0)
         self.assertEqual(calculate_fiber_length(1000, 5, DataSource.PHASE, 5), 2000.0)
+
+    def test_upload_rate_controls_sample_rate(self):
+        self.assertEqual(get_upload_sample_rate_hz(1), 250_000_000.0)
+        self.assertEqual(get_upload_sample_rate_hz(2), 125_000_000.0)
+        self.assertAlmostEqual(get_upload_sample_rate_hz(3), 83_333_333.33333333)
+        self.assertEqual(get_upload_sample_rate_hz(5), 50_000_000.0)
 
 
 if __name__ == "__main__":

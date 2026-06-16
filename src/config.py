@@ -317,6 +317,15 @@ POINT_NUM_ALIGN_2CH = 128
 # DMA memory alignment requirement (PCIe hardware constraint)
 DMA_ALIGNMENT = 4096          # 4KB page alignment for optimal performance
 
+# PCIe-6921 unified upload-rate code to actual sample rate.
+UPLOAD_SAMPLE_RATE_HZ: Dict[int, float] = {
+    1: 250_000_000.0,
+    2: 125_000_000.0,
+    3: 250_000_000.0 / 3.0,
+    4: 62_500_000.0,
+    5: 50_000_000.0,
+}
+
 
 # ----- ERROR CODE DEFINITIONS -----
 # Standard error codes returned by PCIe-6921 API functions
@@ -391,9 +400,19 @@ def validate_point_num(
         return True, ""
 
     if data_source == DataSource.raw:
-        if point_num > MAX_POINT_NUM_1CH or point_num % POINT_NUM_ALIGN_1CH != 0:
-            return False, f"Raw 模式 point_num 必须 <= {MAX_POINT_NUM_1CH} 且为 {POINT_NUM_ALIGN_1CH} 的整数倍"
-        return True, ""
+        if channel_num == 1:
+            if point_num > MAX_POINT_NUM_1CH:
+                return False, f"Raw 单通道模式 point_num 必须 <= {MAX_POINT_NUM_1CH}"
+            if point_num % POINT_NUM_ALIGN_1CH != 0:
+                return False, f"Raw 单通道模式 point_num 必须为 {POINT_NUM_ALIGN_1CH} 的整数倍"
+            return True, ""
+        if channel_num == 2:
+            if point_num > MAX_POINT_NUM_2CH:
+                return False, f"Raw 双通道模式 point_num 必须 <= {MAX_POINT_NUM_2CH}"
+            if point_num % POINT_NUM_ALIGN_2CH != 0:
+                return False, f"Raw 双通道模式 point_num 必须为 {POINT_NUM_ALIGN_2CH} 的整数倍"
+            return True, ""
+        return False, "PCIe-6921 Raw 上传通道数仅支持 1 或 2"
 
     # 单路解调结果上传。
     if channel_num == 1:
@@ -485,6 +504,11 @@ def calculate_fiber_length(point_num: int, data_rate: int, data_source: int, rat
     # 6921 的 upload_rate 同时控制上传链路与 phase_dem 输入速率。
     meters_per_point = {1: 0.4, 2: 0.8, 3: 1.2, 4: 1.6, 5: 2.0}.get(int(data_rate), 0.4)
     return point_num * meters_per_point
+
+
+def get_upload_sample_rate_hz(data_rate: int) -> float:
+    """Return the actual ADC/upload sample rate represented by a 6921 rate code."""
+    return UPLOAD_SAMPLE_RATE_HZ.get(int(data_rate), UPLOAD_SAMPLE_RATE_HZ[1])
 
 
 def calculate_data_rate_mbps(scan_rate: int, point_num: int, channel_num: int) -> float:

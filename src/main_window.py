@@ -32,6 +32,7 @@ from config import (
     CHANNEL_NUM_OPTIONS, DATA_SOURCE_OPTIONS, DATA_RATE_OPTIONS, RATE2PHASE_OPTIONS,
     validate_point_num, calculate_fiber_length, calculate_data_rate_mbps,
     calculate_phase_point_num, calculate_cropped_point_count,
+    get_upload_sample_rate_hz,
     OPTIMIZED_BUFFER_SIZES, MONITOR_UPDATE_INTERVALS
 )
 from pcie6921_api import PCIe6921API, PCIe6921Error
@@ -1490,9 +1491,6 @@ class MainWindow(QMainWindow):
         if params.display.frame_plot_num > params.display.frame_load_num:
             return False, "FramePlot must not exceed FrameLoad."
 
-        if params.upload.data_source == DataSource.raw and params.upload.channel_num != 2:
-            return False, "PCIe-6921 Raw 模式固定使用双 ADC 通道，请选择 2 通道"
-
         if (
             params.upload.data_source == DataSource.PHASE
             and params.basic.point_num_per_scan % params.phase_demod.merge_point_num != 0
@@ -2063,18 +2061,26 @@ class MainWindow(QMainWindow):
                 if len(display_data.shape) == 1:
                     display_data = display_data.reshape(-1, channel_num)
 
+                spectrum_data = None
                 for ch in range(min(channel_num, 2)):
                     space_data = []
                     for i in range(frame_num):
                         idx = region_idx + point_num * i
                         if idx < len(display_data):
                             space_data.append(display_data[idx, ch])
+                    space_data = np.asarray(space_data)
+                    if ch == 0:
+                        spectrum_data = space_data
                     if waveform_enabled:
-                        self.plot_curve_1[ch].setData(np.array(space_data))
+                        self.plot_curve_1[ch].setData(space_data)
 
                 if waveform_enabled:
                     for i in range(channel_num, 4):
                         self.plot_curve_1[i].setData([])
+
+                if self.params.display.spectrum_enable and spectrum_data is not None and len(spectrum_data) > 0:
+                    self._update_spectrum(spectrum_data, self.params.basic.scan_rate,
+                                         psd_mode=False, data_type='int')
 
         else:
             # Time mode: show multiple frames overlay
@@ -2099,6 +2105,11 @@ class MainWindow(QMainWindow):
                 for ch in range(min(channel_num, 4)):
                     if waveform_enabled and point_num <= len(display_data):
                         self.plot_curve_1[ch].setData(display_data[:point_num, ch])
+
+                # Spectrum: use the newest frame of the first channel.
+                if self.params.display.spectrum_enable and point_num <= len(display_data):
+                    self._update_spectrum(display_data[-point_num:, 0], self.params.basic.scan_rate,
+                                         psd_mode=False, data_type='int')
 
         # Time-Space 图独立于 Mode，由 PLOT 按钮控制。
         # 仅在 Tab2 激活时更新 Time-Space 图，避免干扰 Tab1。
@@ -2152,7 +2163,7 @@ class MainWindow(QMainWindow):
 
             # Spectrum: use full-resolution data (Raw data: automatically uses Power Spectrum)
             if self.params.display.spectrum_enable and point_num <= len(display_data):
-                sample_rate = 1e9 / self.params.upload.data_rate
+                sample_rate = get_upload_sample_rate_hz(self.params.upload.data_rate)
                 self._update_spectrum(display_data[-point_num:], sample_rate,
                                      psd_mode=False, data_type='short')  # psd_mode ignored for raw data
         else:
@@ -2165,7 +2176,7 @@ class MainWindow(QMainWindow):
 
             # Spectrum: full-resolution data (Raw data: automatically uses Power Spectrum)
             if self.params.display.spectrum_enable and point_num <= len(display_data):
-                sample_rate = 1e9 / self.params.upload.data_rate
+                sample_rate = get_upload_sample_rate_hz(self.params.upload.data_rate)
                 # Use first channel for spectrum computation
                 self._update_spectrum(display_data[-point_num:, 0], sample_rate,
                                      psd_mode=False, data_type='short')  # psd_mode ignored for raw data
@@ -2492,12 +2503,7 @@ class MainWindow(QMainWindow):
         data_source = self.data_source_combo.currentData()
         is_phase = (data_source == DataSource.PHASE)
 
-        # 厂家文档仅定义双 ADC Raw 上传，切换到 Raw 时同步锁定双通道。
-        if data_source == DataSource.raw:
-            self._set_combo_to_data(self.channel_combo, 2)
-            self.channel_combo.setEnabled(False)
-        else:
-            self.channel_combo.setEnabled(True)
+        self.channel_combo.setEnabled(True)
 
         self._sync_display_control_states()
 
