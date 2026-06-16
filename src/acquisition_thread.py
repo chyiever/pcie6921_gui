@@ -1,0 +1,802 @@
+"""
+`src/acquisition_thread.py` 实现后台采集线程，是设备数据进入上位机后的第一站。
+
+最新版本的采集线程已经不再只是“读数据然后发信号”。它同时负责动态轮询 DLL 缓冲区、控制单次读取块大小、生成完整数据块、维护最新显示快照、裁剪单通道 PHASE 空间范围、上报诊断快照，并在必要时配合主窗口完成停滞检测与自动恢复。
+
+另一个值得记录的经验是：线程内部保留了较完整的运行态指标，例如最近一次查询耗时、最近一次读数耗时、当前阶段名称以及最后一次成功读取距离现在的时间。这些字段对现场分析“到底卡在 GUI、DLL、驱动还是磁盘”非常关键。
+"""
+import threading
+import time
+import numpy as np
+from typing import Callable, Optional
+from PyQt5.QtCore import QThread, pyqtSignal, QMutex, QWaitCondition, Qt
+
+from pcie6921_api import PCIe6921API, PCIe6921Error
+from config import (
+    DataSource,
+    AllParams,
+    POLLING_CONFIG,
+    OPTIMIZED_BUFFER_SIZES,
+    resolve_phase_crop_bounds,
+)
+from logger import get_logger
+
+# Module logger
+log = get_logger("acq_thread")
+
+# Minimum interval between GUI updates (ms)
+MIN_GUI_UPDATE_INTERVAL_MS = 50  # 20 FPS max to prevent Qt signal queue backup
+
+
+# ----- HARDWARE ACQUISITION THREAD -----
+# Polls DMA buffer, reads data, emits Qt signals to GUI thread
+
+class AcquisitionThread(QThread):
+    """
+    Data acquisition thread for PCIe-6921.
+
+    Runs in a separate thread to avoid blocking the GUI.
+    Uses Qt signals to communicate data to the main thread.
+    """
+
+    # Signals
+    data_ready = pyqtSignal(np.ndarray, int, int)  # data, data_type, channel_num
+    phase_data_ready = pyqtSignal(np.ndarray, int)  # phase_data, channel_num
+    monitor_data_ready = pyqtSignal(np.ndarray, int)  # monitor_data, channel_num
+    buffer_status = pyqtSignal(int, int)  # points_in_buffer, buffer_size_mb
+    error_occurred = pyqtSignal(str)  # error message
+    acquisition_started = pyqtSignal()
+    acquisition_stopped = pyqtSignal()
+
+    def __init__(self, api: PCIe6921API, parent=None):
+        """
+        Initialize acquisition thread.
+
+        Args:
+            api: PCIe6921API instance
+            parent: Parent QObject
+        """
+        super().__init__(parent)
+        self.api = api
+        self._running = False
+        self._paused = False
+
+        # Parameters (will be set before starting)
+        self._params: Optional[AllParams] = None
+        self._total_point_num = 0
+        self._point_num_after_merge = 0
+        self._frame_num = 20
+        self._channel_num = 1
+        self._data_source = DataSource.PHASE
+
+        # Thread synchronization
+        self._mutex = QMutex()
+        self._pause_condition = QWaitCondition()
+
+        # Statistics
+        self._frames_acquired = 0
+        self._bytes_acquired = 0
+        self._loop_count = 0
+        self._last_log_time = 0
+        self._phase_emit_count = 0
+        self._raw_emit_count = 0
+        self._monitor_emit_count = 0
+        self._gui_skip_count = 0
+        self._last_buffer_points = 0
+        self._last_expected_points = 0
+        self._last_wait_iterations = 0
+        self._last_query_ms = 0.0
+        self._last_read_ms = 0.0
+        self._last_monitor_read_ms = 0.0
+        self._last_block_bytes = 0
+        self._current_stage = "idle"
+        self._current_stage_detail = ""
+        self._current_stage_started_at = time.perf_counter()
+
+        # Display handoff uses one overwriteable slot instead of queued large-array signals.
+        self._last_gui_update_time = 0
+        self._pending_phase_data = None
+        self._pending_raw_data = None
+        self._pending_monitor_data = None
+        self._latest_display_data = None
+        self._latest_display_lock = threading.Lock()
+        self._full_data_handler: Optional[Callable[[np.ndarray, int, int], None]] = None
+        self._last_successful_read_time = 0.0
+        self._expected_block_duration_ms = 0.0
+
+        # Dynamic polling: switch between fast/slow intervals based on buffer fill.
+        # Hysteresis between high/low thresholds prevents oscillation.
+        self._current_polling_interval = POLLING_CONFIG['low_freq_interval_ms'] / 1000.0
+        self._high_freq_interval = POLLING_CONFIG['high_freq_interval_ms'] / 1000.0
+        self._low_freq_interval = POLLING_CONFIG['low_freq_interval_ms'] / 1000.0
+        self._buffer_threshold_high = POLLING_CONFIG['buffer_threshold_high']
+        self._buffer_threshold_low = POLLING_CONFIG['buffer_threshold_low']
+
+        log.info("AcquisitionThread initialized with dynamic polling")
+
+    def configure(self, params: AllParams):
+        """
+        Configure acquisition parameters.
+
+        Args:
+            params: Configuration parameters
+        """
+        self._params = params
+        self._total_point_num = params.basic.point_num_per_scan
+        self._point_num_after_merge = self._total_point_num // params.phase_demod.merge_point_num
+        self._frame_num = params.display.frame_load_num
+        self._channel_num = params.upload.channel_num
+        self._data_source = params.upload.data_source
+
+        if self._data_source == DataSource.PHASE:
+            points_per_frame = self._point_num_after_merge
+            bytes_per_point = 4
+        else:
+            points_per_frame = self._total_point_num
+            bytes_per_point = 2
+
+        block_points_total = points_per_frame * self._frame_num * self._channel_num
+        block_bytes_total = block_points_total * bytes_per_point
+        block_duration_ms = self._frame_num / max(params.basic.scan_rate, 1) * 1000.0
+        self._expected_block_duration_ms = block_duration_ms
+
+        log.info(f"Configured: total_points={self._total_point_num}, "
+                 f"points_after_merge={self._point_num_after_merge}, "
+                 f"frames={self._frame_num}, channels={self._channel_num}, "
+                 f"data_source={self._data_source}, "
+                 f"crop=[{params.phase_demod.crop_distance_start}, {params.phase_demod.crop_distance_end}), "
+                 f"block_points={block_points_total}, block_bytes={block_bytes_total / 1024 / 1024:.2f}MB, "
+                 f"block_duration={block_duration_ms:.1f}ms")
+
+    def _set_stage(self, stage: str, detail: str = ""):
+        """Track the current internal stage for external diagnostics."""
+        self._current_stage = stage
+        self._current_stage_detail = detail
+        self._current_stage_started_at = time.perf_counter()
+
+    def get_diagnostics_snapshot(self) -> dict:
+        """Return a lightweight diagnostic snapshot for stall analysis."""
+        return {
+            "loop_count": self._loop_count,
+            "frames_acquired": self._frames_acquired,
+            "bytes_acquired": self._bytes_acquired,
+            "phase_emit_count": self._phase_emit_count,
+            "raw_emit_count": self._raw_emit_count,
+            "monitor_emit_count": self._monitor_emit_count,
+            "gui_skip_count": self._gui_skip_count,
+            "current_stage": self._current_stage,
+            "current_stage_detail": self._current_stage_detail,
+            "stage_elapsed_ms": (time.perf_counter() - self._current_stage_started_at) * 1000.0,
+            "last_buffer_points": self._last_buffer_points,
+            "last_expected_points": self._last_expected_points,
+            "last_wait_iterations": self._last_wait_iterations,
+            "last_query_ms": self._last_query_ms,
+            "last_read_ms": self._last_read_ms,
+            "last_monitor_read_ms": self._last_monitor_read_ms,
+            "last_block_bytes": self._last_block_bytes,
+            "last_successful_read_age_s": (
+                time.perf_counter() - self._last_successful_read_time
+                if self._last_successful_read_time > 0
+                else 0.0
+            ),
+            "polling_interval_ms": self._current_polling_interval * 1000.0,
+            "is_running": self.is_running,
+            "is_paused": self.is_paused,
+        }
+
+    def _apply_phase_spatial_crop(self, phase_data: np.ndarray) -> np.ndarray:
+        """Crop single-channel PHASE data before it leaves the acquisition thread."""
+        if (
+            self._params is None
+            or self._data_source != DataSource.PHASE
+            or self._channel_num != 1
+        ):
+            return phase_data
+
+        start, end = resolve_phase_crop_bounds(
+            self._point_num_after_merge,
+            self._params.phase_demod.crop_distance_start,
+            self._params.phase_demod.crop_distance_end,
+        )
+        if start == 0 and end == self._point_num_after_merge:
+            return phase_data
+
+        frame_matrix = phase_data.reshape(self._frame_num, self._point_num_after_merge)
+        cropped = np.ascontiguousarray(frame_matrix[:, start:end])
+        return cropped.reshape(-1)
+
+    def _apply_monitor_spatial_crop(self, monitor_data: np.ndarray) -> np.ndarray:
+        """Crop single-channel monitor data to match the PHASE crop range."""
+        if (
+            self._params is None
+            or self._data_source != DataSource.PHASE
+            or self._channel_num != 1
+        ):
+            return monitor_data
+
+        start, end = resolve_phase_crop_bounds(
+            self._point_num_after_merge,
+            self._params.phase_demod.crop_distance_start,
+            self._params.phase_demod.crop_distance_end,
+        )
+        if start == 0 and end == self._point_num_after_merge:
+            return monitor_data
+
+        return np.ascontiguousarray(monitor_data[start:end])
+
+    def run(self):
+        """Thread main loop"""
+        log.info("=== Acquisition thread started ===")
+        self._running = True
+        self._frames_acquired = 0
+        self._bytes_acquired = 0
+        self._loop_count = 0
+        self._last_log_time = time.time()
+        self._phase_emit_count = 0
+        self._raw_emit_count = 0
+        self._monitor_emit_count = 0
+        self._gui_skip_count = 0
+        self._last_buffer_points = 0
+        self._last_expected_points = 0
+        self._last_wait_iterations = 0
+        self._last_query_ms = 0.0
+        self._last_read_ms = 0.0
+        self._last_monitor_read_ms = 0.0
+        self._last_block_bytes = 0
+        self._last_successful_read_time = time.perf_counter()
+        self.clear_latest_display_data()
+        self._set_stage("started")
+
+        self.acquisition_started.emit()
+        log.debug("acquisition_started signal emitted")
+
+        try:
+            while self._running:
+                self._loop_count += 1
+                loop_start = time.perf_counter()
+
+                # Periodic status log (every 5 seconds)
+                now = time.time()
+                if now - self._last_log_time > 5.0:
+                    snapshot = self.get_diagnostics_snapshot()
+                    log.info(
+                        "Status: "
+                        f"loops={snapshot['loop_count']}, frames={snapshot['frames_acquired']}, "
+                        f"bytes={snapshot['bytes_acquired']/1024/1024:.1f}MB, "
+                        f"stage={snapshot['current_stage']}, stage_ms={snapshot['stage_elapsed_ms']:.1f}, "
+                        f"buffer={snapshot['last_buffer_points']}/{snapshot['last_expected_points']}, "
+                        f"query_ms={snapshot['last_query_ms']:.1f}, read_ms={snapshot['last_read_ms']:.1f}, "
+                        f"emit_phase={snapshot['phase_emit_count']}, emit_raw={snapshot['raw_emit_count']}, "
+                        f"gui_skips={snapshot['gui_skip_count']}"
+                    )
+                    self._last_log_time = now
+
+                # Check for pause
+                self._mutex.lock()
+                while self._paused and self._running:
+                    log.debug("Thread paused, waiting...")
+                    self._pause_condition.wait(self._mutex)
+                self._mutex.unlock()
+
+                if not self._running:
+                    log.info("Thread stopping (running=False after pause check)")
+                    break
+
+                # Determine expected data size
+                if self._data_source == DataSource.PHASE:
+                    expected_points = self._point_num_after_merge * self._frame_num
+                else:
+                    expected_points = self._total_point_num * self._frame_num
+                self._last_expected_points = expected_points
+
+                log.debug(f"Loop {self._loop_count}: waiting for {expected_points} points")
+
+                # Wait for enough data in buffer with dynamic polling
+                wait_start = time.perf_counter()
+                wait_count = 0
+                self._set_stage("wait_buffer", f"expected_points={expected_points}")
+                while self._running:
+                    self._set_stage(
+                        "query_buffer_points",
+                        f"wait_count={wait_count}, expected_points={expected_points}"
+                    )
+                    query_start = time.perf_counter()
+                    try:
+                        points_in_buffer = self.api.query_buffer_points()
+                        query_time = (time.perf_counter() - query_start) * 1000
+                        self._last_buffer_points = points_in_buffer
+                        self._last_query_ms = query_time
+                        self._last_wait_iterations = wait_count
+
+                        if query_time > 50:
+                            log.warning(f"Slow query_buffer_points: {query_time:.1f}ms")
+
+                        # Emit buffer status (throttled)
+                        if wait_count % 100 == 0:
+                            buffer_mb = points_in_buffer * self._channel_num * 2 // (1024 * 1024)
+                            self.buffer_status.emit(points_in_buffer, buffer_mb)
+
+                        if points_in_buffer >= expected_points:
+                            wait_time = (time.perf_counter() - wait_start) * 1000
+                            self._set_stage(
+                                "buffer_ready",
+                                f"points={points_in_buffer}, wait_ms={wait_time:.1f}, waits={wait_count}"
+                            )
+                            log.debug(f"Buffer ready: {points_in_buffer} points, waited {wait_time:.1f}ms ({wait_count} iterations)")
+                            break
+
+                        # Dynamic polling interval adjustment
+                        self._adjust_polling_interval(points_in_buffer, expected_points)
+                        self._set_stage(
+                            "wait_buffer_sleep",
+                            f"points={points_in_buffer}, sleep_ms={self._current_polling_interval * 1000.0:.1f}"
+                        )
+                        time.sleep(self._current_polling_interval)
+                        wait_count += 1
+
+                        if wait_count > 5000:  # 5 second timeout
+                            log.error(f"Timeout waiting for data! points_in_buffer={points_in_buffer}, expected={expected_points}")
+                            self.error_occurred.emit("Timeout waiting for data")
+                            break
+                    except Exception as e:
+                        log.warning(f"Error querying buffer: {e}")
+                        # Check if we should stop
+                        if not self._running:
+                            log.info("Thread stopping due to stop request during buffer query")
+                            break
+                        time.sleep(self._current_polling_interval)
+                        wait_count += 1
+
+                if not self._running:
+                    log.info("Thread stopping (running=False after wait loop)")
+                    break
+
+                # Read data
+                try:
+                    read_start = time.perf_counter()
+                    if self._data_source == DataSource.PHASE:
+                        self._set_stage("read_phase_data", f"expected_points={expected_points}")
+                        self._read_phase_data()
+                    else:
+                        self._set_stage("read_raw_data", f"expected_points={expected_points}")
+                        self._read_raw_data()
+                    read_time = (time.perf_counter() - read_start) * 1000
+                    self._last_read_ms = read_time
+                    self._set_stage("read_complete", f"read_ms={read_time:.1f}")
+                    log.debug(f"Data read completed in {read_time:.1f}ms")
+
+                except PCIe6921Error as e:
+                    self._set_stage("read_error", str(e))
+                    log.error(f"Read error: {e}")
+                    self.error_occurred.emit(str(e))
+                    time.sleep(0.1)
+                    continue
+                except Exception as e:
+                    self._set_stage("read_exception", str(e))
+                    log.error(f"Unexpected read error: {e}")
+                    # Check if we should stop
+                    if not self._running:
+                        log.info("Thread stopping due to stop request during read error")
+                        break
+                    self.error_occurred.emit(f"Read error: {e}")
+                    time.sleep(0.1)
+                    continue
+
+                self._frames_acquired += self._frame_num
+
+                loop_time = (time.perf_counter() - loop_start) * 1000
+                slow_threshold_ms = max(100.0, self._expected_block_duration_ms * 1.5)
+                if loop_time > slow_threshold_ms:
+                    log.warning(
+                        f"Slow loop iteration: {loop_time:.1f}ms "
+                        f"(expected_block={self._expected_block_duration_ms:.1f}ms)"
+                    )
+
+        except Exception as e:
+            log.exception(f"Unexpected acquisition error: {e}")
+            self.error_occurred.emit(f"Acquisition error: {e}")
+
+        finally:
+            self._set_stage("stopped")
+            log.info(f"=== Acquisition thread stopped === (loops={self._loop_count}, frames={self._frames_acquired})")
+            self.acquisition_stopped.emit()
+
+    def _read_raw_data(self):
+        """Read raw IQ data"""
+        points_per_ch = self._total_point_num * self._frame_num
+        log.debug(f"Reading raw data: {points_per_ch} points/ch, {self._channel_num} channels")
+
+        try:
+            log.debug(
+                f"Calling api.read_data: points_per_ch={points_per_ch}, channels={self._channel_num}, "
+                f"estimated_block={points_per_ch * self._channel_num * 2 / 1024 / 1024:.2f}MB"
+            )
+            data, points_returned = self.api.read_data(points_per_ch, self._channel_num)
+        except Exception as e:
+            log.error(f"Failed to read raw data: {e}")
+            raise
+
+        if points_returned != points_per_ch:
+            log.warning(f"Raw read returned unexpected point count: requested={points_per_ch}, returned={points_returned}")
+
+        self._bytes_acquired += len(data) * 2  # short = 2 bytes
+        self._last_block_bytes = int(np.asarray(data).nbytes)
+        self._last_successful_read_time = time.perf_counter()
+
+        # Reshape data by channels
+        if self._channel_num > 1:
+            # Data is interleaved: ch0[0], ch1[0], ch0[1], ch1[1], ...
+            data = data.reshape(-1, self._channel_num)
+
+        self._dispatch_full_data(data, self._data_source, self._channel_num)
+        self._publish_latest_display_data(data, self._data_source, self._channel_num)
+
+    def _read_phase_data(self):
+        """Read phase demodulated data"""
+        points_per_ch = self._point_num_after_merge * self._frame_num
+        log.debug(f"Reading phase data: {points_per_ch} points/ch, {self._channel_num} channels")
+
+        try:
+            log.debug(
+                f"Calling api.read_phase_data: points_per_ch={points_per_ch}, channels={self._channel_num}, "
+                f"estimated_block={points_per_ch * self._channel_num * 4 / 1024 / 1024:.2f}MB"
+            )
+            phase_data, points_returned = self.api.read_phase_data(points_per_ch, self._channel_num)
+        except Exception as e:
+            log.error(f"Failed to read phase data: {e}")
+            raise
+
+        if points_returned != points_per_ch:
+            log.warning(f"Phase read returned unexpected point count: requested={points_per_ch}, returned={points_returned}")
+
+        self._bytes_acquired += len(phase_data) * 4  # int = 4 bytes
+
+        phase_data = self._apply_phase_spatial_crop(phase_data)
+        self._last_block_bytes = int(np.asarray(phase_data).nbytes)
+        self._last_successful_read_time = time.perf_counter()
+
+        # Reshape data by channels
+        if self._channel_num > 1:
+            phase_data = phase_data.reshape(-1, self._channel_num)
+
+        self._dispatch_full_data(phase_data, DataSource.PHASE, self._channel_num)
+        self._publish_latest_display_data(phase_data, DataSource.PHASE, self._channel_num)
+
+        # Also read monitor data when in phase mode
+        try:
+            monitor_start = time.perf_counter()
+            monitor_data = self.api.read_monitor_data(
+                self._point_num_after_merge, self._channel_num
+            )
+            self._last_monitor_read_ms = (time.perf_counter() - monitor_start) * 1000
+            monitor_data = self._apply_monitor_spatial_crop(monitor_data)
+            self._pending_monitor_data = (monitor_data, self._channel_num)
+        except PCIe6921Error as e:
+            log.warning(f"Monitor data read failed (non-critical): {e}")
+        except Exception as e:
+            log.warning(f"Monitor data read failed (non-critical): {e}")
+
+        # Emit all pending data if enough time has passed
+        self._emit_if_ready()
+
+    def set_full_data_handler(self, handler: Optional[Callable[[np.ndarray, int, int], None]]):
+        """Set a non-GUI handler for saving and communication queue handoff."""
+        self._full_data_handler = handler
+
+    def _dispatch_full_data(self, data: np.ndarray, data_source: int, channel_num: int):
+        """Dispatch one complete acquisition block without entering the GUI event queue."""
+        if self._full_data_handler is None:
+            return
+        try:
+            self._full_data_handler(data, data_source, channel_num)
+        except Exception as e:
+            log.exception(f"Full data handler failed: {e}")
+
+    def _publish_latest_display_data(self, data: np.ndarray, data_source: int, channel_num: int):
+        """Replace the latest display snapshot; unconsumed older snapshots are discarded."""
+        points_per_frame = (
+            self._point_num_after_merge
+            if data_source == DataSource.PHASE
+            else self._total_point_num
+        )
+        target_frames = max(1, min(self._params.display.frame_plot_num, self._frame_num))
+        if channel_num == 1:
+            keep_points = min(data.size, points_per_frame * target_frames)
+            display_data = data.reshape(-1)[-keep_points:]
+        else:
+            matrix = data.reshape(-1, channel_num)
+            keep_rows = min(matrix.shape[0], points_per_frame * target_frames)
+            display_data = matrix[-keep_rows:, :]
+        # The display snapshot must not keep the complete acquisition block alive via a view.
+        display_data = np.array(display_data, copy=True, order="C")
+
+        with self._latest_display_lock:
+            if self._latest_display_data is not None:
+                self._gui_skip_count += 1
+            self._latest_display_data = (display_data, data_source, channel_num)
+
+        if data_source == DataSource.PHASE:
+            self._phase_emit_count += 1
+        else:
+            self._raw_emit_count += 1
+
+    def take_latest_display_data(self):
+        """Atomically take the newest display snapshot for GUI-timer consumption."""
+        with self._latest_display_lock:
+            latest = self._latest_display_data
+            self._latest_display_data = None
+        return latest
+
+    def clear_latest_display_data(self):
+        """Release any display snapshot that has not yet been consumed."""
+        with self._latest_display_lock:
+            self._latest_display_data = None
+
+    def _emit_if_ready(self):
+        """Emit pending data signals if enough time has passed since last update"""
+        current_time = time.perf_counter() * 1000  # ms
+        elapsed = current_time - self._last_gui_update_time
+
+        if elapsed < MIN_GUI_UPDATE_INTERVAL_MS:
+            # Not enough time passed, skip this update (keep latest data pending)
+            self._gui_skip_count += 1
+            return
+
+        # Emit all pending signals
+        signals_emitted = 0
+
+        if self._pending_phase_data is not None:
+            phase_data, channel_num = self._pending_phase_data
+            self._phase_emit_count += 1
+            self._set_stage("emit_phase_signal", f"emit_seq={self._phase_emit_count}")
+            log.debug(
+                f"Emitting phase_data_ready signal: seq={self._phase_emit_count}, "
+                f"shape={phase_data.shape}, bytes={np.asarray(phase_data).nbytes / 1024 / 1024:.2f}MB"
+            )
+            self.phase_data_ready.emit(phase_data, channel_num)
+            self._pending_phase_data = None
+            signals_emitted += 1
+
+        if self._pending_raw_data is not None:
+            data, data_source, channel_num = self._pending_raw_data
+            self._raw_emit_count += 1
+            self._set_stage("emit_raw_signal", f"emit_seq={self._raw_emit_count}")
+            log.debug(
+                f"Emitting data_ready signal: seq={self._raw_emit_count}, shape={data.shape}, "
+                f"dtype={data.dtype}, bytes={np.asarray(data).nbytes / 1024 / 1024:.2f}MB"
+            )
+            self.data_ready.emit(data, data_source, channel_num)
+            self._pending_raw_data = None
+            signals_emitted += 1
+
+        if self._pending_monitor_data is not None:
+            monitor_data, channel_num = self._pending_monitor_data
+            self._monitor_emit_count += 1
+            self._set_stage("emit_monitor_signal", f"emit_seq={self._monitor_emit_count}")
+            log.debug(
+                f"Emitting monitor_data_ready signal: seq={self._monitor_emit_count}, "
+                f"shape={monitor_data.shape}, bytes={np.asarray(monitor_data).nbytes / 1024:.1f}KB"
+            )
+            self.monitor_data_ready.emit(monitor_data, channel_num)
+            self._pending_monitor_data = None
+            signals_emitted += 1
+
+        if signals_emitted > 0:
+            self._last_gui_update_time = current_time
+            self._set_stage("emit_complete", f"signals={signals_emitted}, elapsed_ms={elapsed:.1f}")
+            log.debug(f"GUI update: emitted {signals_emitted} signals, elapsed={elapsed:.1f}ms")
+
+    def _adjust_polling_interval(self, points_in_buffer: int, expected_points: int):
+        """Adjust polling interval based on buffer usage"""
+        if expected_points == 0:
+            return
+
+        buffer_usage_ratio = points_in_buffer / expected_points
+
+        if buffer_usage_ratio >= self._buffer_threshold_high:
+            # High buffer usage - use high frequency polling
+            self._current_polling_interval = self._high_freq_interval
+        elif buffer_usage_ratio <= self._buffer_threshold_low:
+            # Low buffer usage - use low frequency polling
+            self._current_polling_interval = self._low_freq_interval
+        # else: keep current interval (hysteresis)
+
+        # Log interval changes (throttled)
+        if self._loop_count % 100 == 0:
+            log.debug(f"Buffer usage: {buffer_usage_ratio:.1%}, polling interval: {self._current_polling_interval*1000:.1f}ms")
+
+    def stop(self):
+        """Request acquisition thread stop (non-blocking)."""
+        snapshot = self.get_diagnostics_snapshot()
+        log.info(
+            "Stop requested: "
+            f"stage={snapshot['current_stage']}, stage_ms={snapshot['stage_elapsed_ms']:.1f}, "
+            f"buffer={snapshot['last_buffer_points']}/{snapshot['last_expected_points']}, "
+            f"query_ms={snapshot['last_query_ms']:.1f}, read_ms={snapshot['last_read_ms']:.1f}"
+        )
+        self._running = False
+        self.clear_latest_display_data()
+        self._set_stage("stop_requested")
+
+        # Wake up if paused
+        self._mutex.lock()
+        self._paused = False
+        self._pause_condition.wakeAll()
+        self._mutex.unlock()
+
+    def wait_until_stopped(self, timeout_ms: int = 5000) -> bool:
+        """Wait for thread exit without force-termination."""
+        if not self.isRunning():
+            return True
+
+        log.debug(f"Waiting for thread to finish (timeout={timeout_ms}ms)...")
+        stopped = self.wait(timeout_ms)
+        if not stopped:
+            snapshot = self.get_diagnostics_snapshot()
+            log.warning(
+                f"Thread did not finish in {timeout_ms}ms: stage={snapshot['current_stage']}, "
+                f"stage_ms={snapshot['stage_elapsed_ms']:.1f}, buffer={snapshot['last_buffer_points']}/"
+                f"{snapshot['last_expected_points']}, query_ms={snapshot['last_query_ms']:.1f}, "
+                f"read_ms={snapshot['last_read_ms']:.1f}"
+            )
+        else:
+            log.debug("Thread finished gracefully")
+        return stopped
+
+    def pause(self):
+        """Pause acquisition"""
+        log.info("Pause requested")
+        self._mutex.lock()
+        self._paused = True
+        self._mutex.unlock()
+
+    def resume(self):
+        """Resume acquisition"""
+        log.info("Resume requested")
+        self._mutex.lock()
+        self._paused = False
+        self._pause_condition.wakeAll()
+        self._mutex.unlock()
+
+    @property
+    def is_running(self) -> bool:
+        """Check if acquisition is running"""
+        return self._running and self.isRunning()
+
+    @property
+    def is_paused(self) -> bool:
+        """Check if acquisition is paused"""
+        return self._paused
+
+    @property
+    def frames_acquired(self) -> int:
+        """Get number of frames acquired"""
+        return self._frames_acquired
+
+    @property
+    def bytes_acquired(self) -> int:
+        """Get total bytes acquired"""
+        return self._bytes_acquired
+
+    @property
+    def point_num_after_merge(self) -> int:
+        """Get points per scan after merge"""
+        return self._point_num_after_merge
+
+    @property
+    def total_point_num(self) -> int:
+        """Get total points per scan"""
+        return self._total_point_num
+
+
+# ----- SIMULATED ACQUISITION THREAD -----
+# Generates random data for UI testing without hardware
+
+class SimulatedAcquisitionThread(AcquisitionThread):
+    """
+    Simulated acquisition thread for testing without hardware.
+    """
+
+    def __init__(self, parent=None):
+        """Initialize with dummy API"""
+        log.info("Creating SimulatedAcquisitionThread")
+
+        # Create a mock API
+        class MockAPI:
+            def query_buffer_points(self):
+                return 100000
+
+            def read_data(self, n, c):
+                return np.random.randint(-32768, 32767, n*c, dtype=np.int16), n
+
+            def read_phase_data(self, n, c):
+                return np.random.randint(-100000, 100000, n*c, dtype=np.int32), n
+
+            def read_monitor_data(self, n, c):
+                return np.random.randint(0, 65535, n*c, dtype=np.uint32)
+
+        self._mock_api = MockAPI()
+        super().__init__(self._mock_api, parent)
+
+    def run(self):
+        """Simulated acquisition loop"""
+        log.info("=== Simulated acquisition thread started ===")
+        self._running = True
+        self._frames_acquired = 0
+        self._bytes_acquired = 0
+        self._loop_count = 0
+        self._last_log_time = time.time()
+
+        self.acquisition_started.emit()
+
+        try:
+            while self._running:
+                self._loop_count += 1
+                loop_start = time.perf_counter()
+
+                # Periodic status log
+                now = time.time()
+                if now - self._last_log_time > 5.0:
+                    log.info(f"Simulation status: loops={self._loop_count}, frames={self._frames_acquired}")
+                    self._last_log_time = now
+
+                # Check for pause
+                self._mutex.lock()
+                while self._paused and self._running:
+                    self._pause_condition.wait(self._mutex)
+                self._mutex.unlock()
+
+                if not self._running:
+                    break
+
+                # Simulate acquisition delay based on scan rate
+                scan_rate = self._params.basic.scan_rate if self._params else 2000
+                delay = self._frame_num / max(scan_rate, 1)
+                time.sleep(delay)
+
+                # Generate simulated data
+                if self._data_source == DataSource.PHASE:
+                    points = self._point_num_after_merge * self._frame_num
+                    phase_data = np.random.randint(-100000, 100000, points * self._channel_num, dtype=np.int32)
+
+                    phase_data = self._apply_phase_spatial_crop(phase_data)
+
+                    if self._channel_num > 1:
+                        phase_data = phase_data.reshape(-1, self._channel_num)
+
+                    self._dispatch_full_data(phase_data, DataSource.PHASE, self._channel_num)
+                    self._publish_latest_display_data(phase_data, DataSource.PHASE, self._channel_num)
+                    self._bytes_acquired += len(phase_data.flatten()) * 4
+
+                    # Simulated monitor data
+                    monitor_data = np.random.randint(0, 65535, self._point_num_after_merge * self._channel_num, dtype=np.uint32)
+                    monitor_data = self._apply_monitor_spatial_crop(monitor_data)
+                    self._pending_monitor_data = (monitor_data, self._channel_num)
+                else:
+                    points = self._total_point_num * self._frame_num
+                    data = np.random.randint(-32768, 32767, points * self._channel_num, dtype=np.int16)
+
+                    if self._channel_num > 1:
+                        data = data.reshape(-1, self._channel_num)
+
+                    self._dispatch_full_data(data, self._data_source, self._channel_num)
+                    self._publish_latest_display_data(data, self._data_source, self._channel_num)
+                    self._bytes_acquired += len(data.flatten()) * 2
+                self._last_successful_read_time = time.perf_counter()
+
+                # Emit buffer status (throttle this too - only every 10 loops)
+                if self._loop_count % 10 == 0:
+                    self.buffer_status.emit(100000, 10)
+
+                self._frames_acquired += self._frame_num
+
+                loop_time = (time.perf_counter() - loop_start) * 1000
+                log.debug(f"Simulation loop {self._loop_count}: {loop_time:.1f}ms")
+
+        except Exception as e:
+            log.exception(f"Simulation error: {e}")
+            self.error_occurred.emit(f"Simulation error: {e}")
+
+        finally:
+            log.info(f"=== Simulated acquisition thread stopped === (loops={self._loop_count})")
+            self.acquisition_stopped.emit()
