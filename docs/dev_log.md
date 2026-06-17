@@ -21,3 +21,4 @@
 - 2026-06-17 - 参照 `PCIe-7821` 上位机打包脚本新增 `build_exe.py`，适配 `PCIe-6921` 入口、`pcie6921_api` 隐藏导入、`libs/pcie6921_api.dll` 和 `resources` 资源打包，支持默认无控制台 onefile、调试控制台、清理输出、自定义名称和 UPX 目录参数。
 - 2026-06-17 - 修改 Tab1 时域图横轴物理坐标：Raw 模式按 `DataRate` 显示 `Distance (m)`，Phase `Mode=time` 按 `Rate2Phase × Merge` 显示 `Distance (m)`，Phase `Mode=space` 按 `Scan(Hz)` 显示 `Time (s)`；新增 `2026-6-17-tab1时域图坐标轴修改日志.md` 并完成 UTF-8 中文自检。
 - 2026-06-17 - 修复 Phase `Mode=space` 时域波形可见性问题：横轴从 `Distance (m)` 切换到 `Time (s)` 时自动解除 Plot1 手动缩放锁并恢复全视图，同时修正单通道 Phase 空间裁剪后显示快照每帧点数计算，补充单元测试与坐标轴修改日志。
+- 2026-06-17 - 继续优化 Phase `Mode=time/space` 切换后 Plot1 波形可见性：在 Mode 切换和 `Waveform` 打开时请求重置范围，并用本帧 X/Y 数据显式 `setRange()`，避免 `ClipToView` 与旧视图范围导致需手动 Auto 才能显示波形。

@@ -242,9 +242,9 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(logo_label)
 
-        # Title - SimHei bold 28pt (Chinese UI text)
+        # Title - Arial bold 28pt
         title_label = QLabel("Enhanced Distributed Acoustic Sensing (eDAS)")
-        title_font = QFont("SimHei", 28, QFont.Bold)
+        title_font = QFont("Arial", 28, QFont.Bold)
         title_label.setFont(title_font)
         title_label.setAlignment(Qt.AlignCenter)
 
@@ -1097,9 +1097,11 @@ class MainWindow(QMainWindow):
         view_box.enableAutoRange(x=True, y=True)
         view_box.autoRange(padding=0.0)
 
-    def _restore_tab1_auto_range_after_axis_change(self):
-        """Restore Plot1 visibility after switching between distance and time axes."""
-        self._restore_plot_auto_range("plot1")
+    def _request_tab1_axis_reset(self) -> None:
+        """Mark Plot1 for an explicit range reset on the next waveform update."""
+        self._tab1_axis_reset_pending = True
+        self._plot_zoom_locked["plot1"] = False
+        self.plot_widget_1.getViewBox().enableAutoRange(x=True, y=True)
 
     def _setup_plots(self):
         """Initialize plot curves"""
@@ -1192,6 +1194,8 @@ class MainWindow(QMainWindow):
         """Enable or disable waveform rendering on plot 1."""
         if not enabled:
             self._clear_waveform_plot()
+        else:
+            self._request_tab1_axis_reset()
 
     @pyqtSlot(bool)
     def _on_monitor_display_toggled(self, enabled: bool):
@@ -1586,16 +1590,47 @@ class MainWindow(QMainWindow):
         )
         if axis_changed:
             self._tab1_waveform_x_label = text
-            self._tab1_axis_reset_pending = True
-            self._plot_zoom_locked["plot1"] = False
-            self.plot_widget_1.getViewBox().enableAutoRange(x=True, y=True)
+            self._request_tab1_axis_reset()
 
-    def _flush_tab1_axis_reset(self) -> None:
-        """Apply deferred Plot1 auto-range reset after new axis data has been set."""
+    def _flush_tab1_axis_reset(self, x_values: np.ndarray, y_values: list[np.ndarray]) -> None:
+        """Apply deferred Plot1 range reset using the just-written waveform data."""
         if not self._tab1_axis_reset_pending:
             return
+        x_values = np.asarray(x_values)
+        finite_y = [
+            np.asarray(values).reshape(-1)
+            for values in y_values
+            if values is not None and np.asarray(values).size > 0
+        ]
+        if x_values.size == 0 or not finite_y:
+            return
+
+        y_concat = np.concatenate(finite_y)
+        x_finite = x_values[np.isfinite(x_values)]
+        y_finite = y_concat[np.isfinite(y_concat)]
+        if x_finite.size == 0 or y_finite.size == 0:
+            return
+
         self._tab1_axis_reset_pending = False
-        QTimer.singleShot(0, self._restore_tab1_auto_range_after_axis_change)
+        self._plot_zoom_locked["plot1"] = False
+        view_box = self.plot_widget_1.getViewBox()
+        view_box.enableAutoRange(x=False, y=False)
+        x_min = float(np.min(x_finite))
+        x_max = float(np.max(x_finite))
+        y_min = float(np.min(y_finite))
+        y_max = float(np.max(y_finite))
+        if x_min == x_max:
+            x_min -= 0.5
+            x_max += 0.5
+        if y_min == y_max:
+            y_min -= 0.5
+            y_max += 0.5
+        view_box.setRange(
+            xRange=(x_min, x_max),
+            yRange=(y_min, y_max),
+            padding=0.02,
+            disableAutoRange=False,
+        )
 
     def get_tab3_comm_settings(self) -> Dict[str, Any]:
         """Return the current TCP communication settings."""
@@ -2085,6 +2120,7 @@ class MainWindow(QMainWindow):
         if self.params.display.mode == DisplayMode.SPACE:
             time_axis = self._phase_time_axis(frame_num)
             self._set_tab1_waveform_x_label('Time (s)')
+            tab1_y_values = []
             # Space mode: extract single region over time
             region_idx = min(self.params.display.region_index, point_num - 1)
 
@@ -2097,6 +2133,7 @@ class MainWindow(QMainWindow):
                         space_data.append(display_data[idx])
 
                 space_data = np.array(space_data)
+                tab1_y_values.append(space_data)
                 if waveform_enabled:
                     self.plot_curve_1[0].setData(time_axis[:len(space_data)], space_data)
 
@@ -2123,6 +2160,7 @@ class MainWindow(QMainWindow):
                     space_data = np.asarray(space_data)
                     if ch == 0:
                         spectrum_data = space_data
+                    tab1_y_values.append(space_data)
                     if waveform_enabled:
                         self.plot_curve_1[ch].setData(time_axis[:len(space_data)], space_data)
 
@@ -2133,18 +2171,21 @@ class MainWindow(QMainWindow):
                 if self.params.display.spectrum_enable and spectrum_data is not None and len(spectrum_data) > 0:
                     self._update_spectrum(spectrum_data, self.params.basic.scan_rate,
                                          psd_mode=False, data_type='int')
-            self._flush_tab1_axis_reset()
+            self._flush_tab1_axis_reset(time_axis, tab1_y_values)
 
         else:
             distance_axis = self._phase_distance_axis(point_num)
             self._set_tab1_waveform_x_label('Distance (m)')
+            tab1_y_values = []
             # Time mode: show multiple frames overlay
             if channel_num == 1:
                 for i in range(min(4, frame_num)):
                     start = i * point_num
                     end = start + point_num
                     if waveform_enabled and end <= len(display_data):
-                        self.plot_curve_1[i].setData(distance_axis, display_data[start:end])
+                        frame_data = display_data[start:end]
+                        tab1_y_values.append(frame_data)
+                        self.plot_curve_1[i].setData(distance_axis, frame_data)
                     elif waveform_enabled:
                         self.plot_curve_1[i].setData([])
 
@@ -2159,13 +2200,15 @@ class MainWindow(QMainWindow):
                 # Show first frame of each channel
                 for ch in range(min(channel_num, 4)):
                     if waveform_enabled and point_num <= len(display_data):
-                        self.plot_curve_1[ch].setData(distance_axis, display_data[:point_num, ch])
+                        channel_frame = display_data[:point_num, ch]
+                        tab1_y_values.append(channel_frame)
+                        self.plot_curve_1[ch].setData(distance_axis, channel_frame)
 
                 # Spectrum: use the newest frame of the first channel.
                 if self.params.display.spectrum_enable and point_num <= len(display_data):
                     self._update_spectrum(display_data[-point_num:, 0], self.params.basic.scan_rate,
                                          psd_mode=False, data_type='int')
-            self._flush_tab1_axis_reset()
+            self._flush_tab1_axis_reset(distance_axis, tab1_y_values)
 
         # Time-Space 图独立于 Mode，由 PLOT 按钮控制。
         # 仅在 Tab2 激活时更新 Time-Space 图，避免干扰 Tab1。
@@ -2209,6 +2252,7 @@ class MainWindow(QMainWindow):
 
         distance_axis = self._raw_distance_axis(point_num)
         self._set_tab1_waveform_x_label('Distance (m)')
+        tab1_y_values = []
 
         if channel_num == 1:
             # Show full-resolution frames; pyqtgraph handles view clipping/downsampling.
@@ -2216,7 +2260,9 @@ class MainWindow(QMainWindow):
                 start = i * point_num
                 end = start + point_num
                 if waveform_enabled and end <= len(display_data):
-                    self.plot_curve_1[i].setData(distance_axis, display_data[start:end])
+                    frame_data = display_data[start:end]
+                    tab1_y_values.append(frame_data)
+                    self.plot_curve_1[i].setData(distance_axis, frame_data)
                 elif waveform_enabled:
                     self.plot_curve_1[i].setData([])
 
@@ -2231,7 +2277,9 @@ class MainWindow(QMainWindow):
 
             for ch in range(min(channel_num, 4)):
                 if waveform_enabled and point_num <= len(display_data):
-                    self.plot_curve_1[ch].setData(distance_axis, display_data[:point_num, ch])
+                    channel_frame = display_data[:point_num, ch]
+                    tab1_y_values.append(channel_frame)
+                    self.plot_curve_1[ch].setData(distance_axis, channel_frame)
 
             # Spectrum: full-resolution data (Raw data: automatically uses Power Spectrum)
             if self.params.display.spectrum_enable and point_num <= len(display_data):
@@ -2239,7 +2287,7 @@ class MainWindow(QMainWindow):
                 # Use first channel for spectrum computation
                 self._update_spectrum(display_data[-point_num:, 0], sample_rate,
                                      psd_mode=False, data_type='short')  # psd_mode ignored for raw data
-        self._flush_tab1_axis_reset()
+        self._flush_tab1_axis_reset(distance_axis, tab1_y_values)
 
     def _update_monitor_display(self, data: np.ndarray, channel_num: int):
         """Update monitor plot"""
@@ -2553,6 +2601,7 @@ class MainWindow(QMainWindow):
 
                     # 更新空间位置索引。
                     self.params.display.region_index = self.region_index_spin.value()
+                    self._request_tab1_axis_reset()
                 else:
                     log.warning("Params not initialized, mode change ignored")
             except Exception as e:
