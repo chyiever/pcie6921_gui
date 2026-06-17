@@ -24,6 +24,16 @@ from logger import get_logger
 # Module logger
 log = get_logger("acq_thread")
 
+
+def _percentile(values, percentile: float) -> float:
+    """Return a lightweight percentile for diagnostic timing samples."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = int(round((len(ordered) - 1) * percentile / 100.0))
+    return ordered[max(0, min(index, len(ordered) - 1))]
+
+
 # Minimum interval between GUI updates (ms)
 MIN_GUI_UPDATE_INTERVAL_MS = 50  # 20 FPS max to prevent Qt signal queue backup
 
@@ -89,6 +99,13 @@ class AcquisitionThread(QThread):
         self._last_read_ms = 0.0
         self._last_monitor_read_ms = 0.0
         self._last_block_bytes = 0
+        self._query_samples_ms = []
+        self._read_samples_ms = []
+        self._query_slow_count = 0
+        self._query_consecutive_slow = 0
+        self._read_slow_count = 0
+        self._query_slow_threshold_ms = 100.0
+        self._read_hard_warn_ms = 200.0
         self._current_stage = "idle"
         self._current_stage_detail = ""
         self._current_stage_started_at = time.perf_counter()
@@ -173,6 +190,15 @@ class AcquisitionThread(QThread):
             "last_query_ms": self._last_query_ms,
             "last_read_ms": self._last_read_ms,
             "last_monitor_read_ms": self._last_monitor_read_ms,
+            "query_p95_ms": _percentile(self._query_samples_ms, 95),
+            "query_p99_ms": _percentile(self._query_samples_ms, 99),
+            "query_max_ms": max(self._query_samples_ms, default=0.0),
+            "query_slow_count": self._query_slow_count,
+            "query_consecutive_slow": self._query_consecutive_slow,
+            "read_p95_ms": _percentile(self._read_samples_ms, 95),
+            "read_p99_ms": _percentile(self._read_samples_ms, 99),
+            "read_max_ms": max(self._read_samples_ms, default=0.0),
+            "read_slow_count": self._read_slow_count,
             "last_block_bytes": self._last_block_bytes,
             "last_successful_read_age_s": (
                 time.perf_counter() - self._last_successful_read_time
@@ -243,6 +269,11 @@ class AcquisitionThread(QThread):
         self._last_read_ms = 0.0
         self._last_monitor_read_ms = 0.0
         self._last_block_bytes = 0
+        self._query_samples_ms = []
+        self._read_samples_ms = []
+        self._query_slow_count = 0
+        self._query_consecutive_slow = 0
+        self._read_slow_count = 0
         self._last_successful_read_time = time.perf_counter()
         self.clear_latest_display_data()
         self._set_stage("started")
@@ -266,6 +297,8 @@ class AcquisitionThread(QThread):
                         f"stage={snapshot['current_stage']}, stage_ms={snapshot['stage_elapsed_ms']:.1f}, "
                         f"buffer={snapshot['last_buffer_points']}/{snapshot['last_expected_points']}, "
                         f"query_ms={snapshot['last_query_ms']:.1f}, read_ms={snapshot['last_read_ms']:.1f}, "
+                        f"query_p95={snapshot['query_p95_ms']:.1f}, read_p95={snapshot['read_p95_ms']:.1f}, "
+                        f"query_slow={snapshot['query_slow_count']}, read_slow={snapshot['read_slow_count']}, "
                         f"emit_phase={snapshot['phase_emit_count']}, emit_raw={snapshot['raw_emit_count']}, "
                         f"gui_skips={snapshot['gui_skip_count']}"
                     )
@@ -307,9 +340,21 @@ class AcquisitionThread(QThread):
                         self._last_buffer_points = points_in_buffer
                         self._last_query_ms = query_time
                         self._last_wait_iterations = wait_count
+                        self._query_samples_ms.append(query_time)
 
-                        if query_time > 50:
-                            log.warning(f"Slow query_buffer_points: {query_time:.1f}ms")
+                        if query_time >= self._query_slow_threshold_ms:
+                            self._query_slow_count += 1
+                            self._query_consecutive_slow += 1
+                            if self._query_consecutive_slow == 3 or self._query_consecutive_slow % 10 == 0:
+                                log.warning(
+                                    f"Repeated slow query_buffer_points: current={query_time:.1f}ms, "
+                                    f"consecutive={self._query_consecutive_slow}, "
+                                    f"slow_count={self._query_slow_count}, "
+                                    f"p95={_percentile(self._query_samples_ms, 95):.1f}ms, "
+                                    f"p99={_percentile(self._query_samples_ms, 99):.1f}ms"
+                                )
+                        else:
+                            self._query_consecutive_slow = 0
 
                         # Emit buffer status (throttled)
                         if wait_count % 100 == 0:
@@ -362,7 +407,19 @@ class AcquisitionThread(QThread):
                         self._read_raw_data()
                     read_time = (time.perf_counter() - read_start) * 1000
                     self._last_read_ms = read_time
+                    self._read_samples_ms.append(read_time)
                     self._set_stage("read_complete", f"read_ms={read_time:.1f}")
+                    read_warn_ms = self._read_warn_threshold_ms()
+                    if read_time >= read_warn_ms:
+                        self._read_slow_count += 1
+                        log.warning(
+                            f"Slow data read: read_ms={read_time:.1f}, threshold_ms={read_warn_ms:.1f}, "
+                            f"expected_points={expected_points}, buffer={self._last_buffer_points}, "
+                            f"block_mb={self._last_block_bytes / 1024 / 1024:.2f}, "
+                            f"p95={_percentile(self._read_samples_ms, 95):.1f}ms, "
+                            f"p99={_percentile(self._read_samples_ms, 99):.1f}ms, "
+                            f"slow_count={self._read_slow_count}"
+                        )
                     log.debug(f"Data read completed in {read_time:.1f}ms")
 
                 except PCIe6921Error as e:
@@ -604,6 +661,12 @@ class AcquisitionThread(QThread):
         # Log interval changes (throttled)
         if self._loop_count % 100 == 0:
             log.debug(f"Buffer usage: {buffer_usage_ratio:.1%}, polling interval: {self._current_polling_interval*1000:.1f}ms")
+
+    def _read_warn_threshold_ms(self) -> float:
+        """Scale slow-read warnings to block duration while keeping a practical floor."""
+        if self._expected_block_duration_ms <= 0:
+            return self._read_hard_warn_ms
+        return max(50.0, min(self._read_hard_warn_ms, self._expected_block_duration_ms * 0.25))
 
     def stop(self):
         """Request acquisition thread stop (non-blocking)."""

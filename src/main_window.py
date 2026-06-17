@@ -2409,6 +2409,12 @@ class MainWindow(QMainWindow):
             f"waits={snapshot['last_wait_iterations']}",
             f"query_ms={snapshot['last_query_ms']:.1f}",
             f"read_ms={snapshot['last_read_ms']:.1f}",
+            f"query_p95={snapshot['query_p95_ms']:.1f}",
+            f"query_p99={snapshot['query_p99_ms']:.1f}",
+            f"query_slow={snapshot['query_slow_count']}",
+            f"read_p95={snapshot['read_p95_ms']:.1f}",
+            f"read_p99={snapshot['read_p99_ms']:.1f}",
+            f"read_slow={snapshot['read_slow_count']}",
             f"read_age_s={snapshot['last_successful_read_age_s']:.1f}",
             f"monitor_ms={snapshot['last_monitor_read_ms']:.1f}",
             f"block_mb={snapshot['last_block_bytes'] / 1024 / 1024:.2f}",
@@ -2429,6 +2435,10 @@ class MainWindow(QMainWindow):
                 f"save_dropped={saver['dropped_blocks']}",
                 f"save_written={saver['blocks_written']}",
                 f"save_last_write_ms={saver['last_write_ms']:.1f}",
+                f"save_write_p95={saver['write_p95_ms']:.1f}",
+                f"save_write_p99={saver['write_p99_ms']:.1f}",
+                f"save_write_slow={saver['write_slow_count']}",
+                f"save_total_bytes={saver['total_bytes']}",
             ])
 
         log.info("Acq snapshot: " + ", ".join(parts))

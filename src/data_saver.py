@@ -19,6 +19,15 @@ from logger import get_logger
 log = get_logger("data_saver")
 
 
+def _percentile(values, percentile: float) -> float:
+    """Return a small-sample percentile without pulling in extra dependencies."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = int(round((len(ordered) - 1) * percentile / 100.0))
+    return ordered[max(0, min(index, len(ordered) - 1))]
+
+
 # ----- BASE DATA SAVER -----
 # Single-file async saver: data queued from producer, written by background thread
 
@@ -58,6 +67,13 @@ class DataSaver:
         self._max_queue_size_seen = 0
         self._last_write_ms = 0.0
         self._last_write_bytes = 0
+        self._write_samples_ms = []
+        self._write_slow_count = 0
+        self._write_consecutive_slow = 0
+        self._write_warn_every = 10
+        self._write_min_mib_s = 150.0
+        self._write_hard_warn_ms = 500.0
+        self._write_throughput_warn_min_bytes = 1024 * 1024
 
     def start(self, file_no: Optional[int] = None, scan_rate: int = 2000) -> str:
         """
@@ -103,6 +119,9 @@ class DataSaver:
         self._max_queue_size_seen = 0
         self._last_write_ms = 0.0
         self._last_write_bytes = 0
+        self._write_samples_ms = []
+        self._write_slow_count = 0
+        self._write_consecutive_slow = 0
 
         # Clear queue
         while not self._data_queue.empty():
@@ -142,10 +161,15 @@ class DataSaver:
             self._file_handle.close()
             self._file_handle = None
 
-        log.info(f"Stopped saving. Bytes written: {self._bytes_written}, "
-                 f"Blocks: {self._blocks_written}, Dropped: {self._dropped_blocks}, "
-                 f"Max queue: {self._max_queue_size_seen}/{self.buffer_size}, "
-                 f"Last write: {self._last_write_ms:.1f}ms/{self._last_write_bytes}B")
+        log.info(
+            f"Stopped saving. Current file bytes: {self._bytes_written}, "
+            f"Total bytes: {self.total_bytes_all_files}, Blocks: {self._blocks_written}, "
+            f"Dropped: {self._dropped_blocks}, Max queue: {self._max_queue_size_seen}/{self.buffer_size}, "
+            f"Last write: {self._last_write_ms:.1f}ms/{self._last_write_bytes}B, "
+            f"Write p50/p95/p99/max: {self._write_percentile(50):.1f}/"
+            f"{self._write_percentile(95):.1f}/{self._write_percentile(99):.1f}/"
+            f"{max(self._write_samples_ms, default=0.0):.1f}ms, slow_writes={self._write_slow_count}"
+        )
 
     def save(self, data: np.ndarray) -> bool:
         """
@@ -219,20 +243,47 @@ class DataSaver:
             if isinstance(data, np.ndarray):
                 if data.dtype != np.int32:
                     data = data.astype(np.int32)
-                payload = data.tobytes()
+                if not data.flags.c_contiguous:
+                    data = np.ascontiguousarray(data)
+                payload = memoryview(data).cast('B')
+                payload_len = data.nbytes
             else:
                 payload = data
+                payload_len = len(data)
 
             self._file_handle.write(payload)
             self._last_write_ms = (time.perf_counter() - start) * 1000
-            self._last_write_bytes = len(payload)
-            self._bytes_written += len(payload)
+            self._last_write_bytes = payload_len
+            self._bytes_written += payload_len
             self._blocks_written += 1
-            if self._last_write_ms > 50:
+            self._write_samples_ms.append(self._last_write_ms)
+
+            throughput_mib_s = 0.0
+            if self._last_write_ms > 0:
+                throughput_mib_s = payload_len / (1024 * 1024) / (self._last_write_ms / 1000.0)
+            is_slow = self._last_write_ms >= self._write_hard_warn_ms
+            if payload_len >= self._write_throughput_warn_min_bytes:
+                is_slow = is_slow or throughput_mib_s < self._write_min_mib_s
+            if is_slow:
+                self._write_slow_count += 1
+                self._write_consecutive_slow += 1
+            else:
+                self._write_consecutive_slow = 0
+
+            if is_slow and (
+                self._write_slow_count <= 3
+                or self._write_slow_count % self._write_warn_every == 0
+                or self._data_queue.qsize() > 0
+            ):
                 log.warning(
-                    f"Slow disk write: {self._last_write_ms:.1f}ms, bytes={len(payload)}, "
-                    f"queue={self._data_queue.qsize()}/{self.buffer_size}"
+                    f"Slow disk write: {self._last_write_ms:.1f}ms, bytes={payload_len}, "
+                    f"throughput={throughput_mib_s:.1f}MiB/s, queue={self._data_queue.qsize()}/{self.buffer_size}, "
+                    f"slow_count={self._write_slow_count}, consecutive={self._write_consecutive_slow}, "
+                    f"p95={self._write_percentile(95):.1f}ms"
                 )
+
+    def _write_percentile(self, percentile: float) -> float:
+        return _percentile(self._write_samples_ms, percentile)
 
     def get_diagnostics_snapshot(self) -> dict:
         """Return save-thread diagnostics for periodic logging."""
@@ -246,6 +297,12 @@ class DataSaver:
             "max_queue_size_seen": self._max_queue_size_seen,
             "last_write_ms": self._last_write_ms,
             "last_write_bytes": self._last_write_bytes,
+            "total_bytes": self.total_bytes_all_files,
+            "write_p50_ms": self._write_percentile(50),
+            "write_p95_ms": self._write_percentile(95),
+            "write_p99_ms": self._write_percentile(99),
+            "write_max_ms": max(self._write_samples_ms, default=0.0),
+            "write_slow_count": self._write_slow_count,
             "is_running": self._running,
         }
 
@@ -257,6 +314,11 @@ class DataSaver:
     @property
     def bytes_written(self) -> int:
         """Get total bytes written"""
+        return self._bytes_written
+
+    @property
+    def total_bytes_all_files(self) -> int:
+        """Get total bytes written by this saver."""
         return self._bytes_written
 
     @property
@@ -349,6 +411,7 @@ class FrameBasedFileSaver(DataSaver):
         self._scan_rate = scan_rate
         self._points_per_frame = points_per_frame
         self._frame_count = 0
+        self._total_bytes_all_files = 0
         self._total_files_created = 1
 
         # Create filename: seq-eDAS-rateHz-pointspt-timestamp.ms.bin
@@ -364,6 +427,13 @@ class FrameBasedFileSaver(DataSaver):
         self._bytes_written = 0
         self._blocks_written = 0
         self._dropped_blocks = 0
+        self._enqueue_count = 0
+        self._max_queue_size_seen = 0
+        self._last_write_ms = 0.0
+        self._last_write_bytes = 0
+        self._write_samples_ms = []
+        self._write_slow_count = 0
+        self._write_consecutive_slow = 0
 
         # Clear queue
         while not self._data_queue.empty():
@@ -444,10 +514,14 @@ class FrameBasedFileSaver(DataSaver):
 
     def stop(self):
         """Stop and update total statistics"""
+        if not self._running:
+            return
         super().stop()
-        log.info(f"Total files created: {self._total_files_created}, "
-                 f"Total frames saved: {(self._total_files_created - 1) * self.frames_per_file + self._frame_count}, "
-                 f"Total bytes: {self.total_bytes_all_files}")
+        log.info(
+            f"Frame saver summary: files={self._total_files_created}, "
+            f"frames_saved={(self._total_files_created - 1) * self.frames_per_file + self._frame_count}, "
+            f"total_bytes={self.total_bytes_all_files}"
+        )
 
     @property
     def total_bytes_all_files(self) -> int:
@@ -548,10 +622,11 @@ class TimedFileSaver(DataSaver):
 
     def stop(self):
         """Stop and update total statistics"""
-        self._total_bytes_all_files += self._bytes_written
+        if not self._running:
+            return
         super().stop()
         log.info(f"Total files created: {self._total_files_created}, "
-                 f"Total bytes: {self._total_bytes_all_files}")
+                 f"Total bytes: {self.total_bytes_all_files}")
 
     @property
     def total_bytes_all_files(self) -> int:

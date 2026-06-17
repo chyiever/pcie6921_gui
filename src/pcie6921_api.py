@@ -474,8 +474,8 @@ class PCIe6921API:
             elapsed = (time.perf_counter() - start) * 1000
         self._check_result(result, "point_num_per_ch_in_buf_query")
 
-        # Only log occasionally to avoid spam (every 100th call or when slow)
-        if elapsed > 10:
+        # Keep single-call DLL timing here; acquisition_thread aggregates repeated slow queries.
+        if elapsed >= 100:
             log.warning(f"query_buffer_points took {elapsed:.1f} ms, points={point_num.value}")
 
         return point_num.value
