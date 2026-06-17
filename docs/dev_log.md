@@ -22,3 +22,4 @@
 - 2026-06-17 - 修改 Tab1 时域图横轴物理坐标：Raw 模式按 `DataRate` 显示 `Distance (m)`，Phase `Mode=time` 按 `Rate2Phase × Merge` 显示 `Distance (m)`，Phase `Mode=space` 按 `Scan(Hz)` 显示 `Time (s)`；新增 `2026-6-17-tab1时域图坐标轴修改日志.md` 并完成 UTF-8 中文自检。
 - 2026-06-17 - 修复 Phase `Mode=space` 时域波形可见性问题：横轴从 `Distance (m)` 切换到 `Time (s)` 时自动解除 Plot1 手动缩放锁并恢复全视图，同时修正单通道 Phase 空间裁剪后显示快照每帧点数计算，补充单元测试与坐标轴修改日志。
 - 2026-06-17 - 继续优化 Phase `Mode=time/space` 切换后 Plot1 波形可见性：在 Mode 切换和 `Waveform` 打开时请求重置范围，并用本帧 X/Y 数据显式 `setRange()`，避免 `ClipToView` 与旧视图范围导致需手动 Auto 才能显示波形。
+- 2026-06-18 - 参照 PCIe-7821 Tab1 时域图坐标轴修改日志，补齐 6921 Plot1 横轴切换后的视图恢复兜底：关闭秒级 time 轴的 clip/downsampling，从曲线真实数据计算边界并延迟重试 `setRange()`，主动刷新曲线项和 ViewBox。

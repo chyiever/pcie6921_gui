@@ -86,6 +86,8 @@ class MainWindow(QMainWindow):
         self._plot_zoom_locked: Dict[str, bool] = {}
         self._tab1_waveform_x_label: Optional[str] = None
         self._tab1_axis_reset_pending = False
+        self._tab1_axis_reset_frames_remaining = 0
+        self._tab1_axis_reset_generation = 0
         self._settings_path = self._get_settings_path()
 
         # Parameters
@@ -1100,8 +1102,132 @@ class MainWindow(QMainWindow):
     def _request_tab1_axis_reset(self) -> None:
         """Mark Plot1 for an explicit range reset on the next waveform update."""
         self._tab1_axis_reset_pending = True
+        self._tab1_axis_reset_frames_remaining = max(self._tab1_axis_reset_frames_remaining, 4)
+        self._tab1_axis_reset_generation += 1
         self._plot_zoom_locked["plot1"] = False
         self.plot_widget_1.getViewBox().enableAutoRange(x=True, y=True)
+
+    def _tab1_axis_kind_from_label(self, text: Optional[str] = None) -> str:
+        """Return the logical Plot1 axis kind represented by a label."""
+        label = text if text is not None else self._tab1_waveform_x_label
+        return "time" if label == "Time (s)" else "distance"
+
+    def _configure_tab1_curves_for_axis(self, axis_kind: str) -> None:
+        """Adjust Plot1 curve performance options for the active x-axis kind."""
+        if not hasattr(self, 'plot_curve_1'):
+            return
+        for curve in self.plot_curve_1:
+            if axis_kind == "time":
+                curve.setClipToView(False)
+                curve.setDownsampling(auto=False)
+            else:
+                self._configure_realtime_curve(curve)
+
+    def _refresh_tab1_curve_items(self) -> None:
+        """Refresh Plot1 drawing items after forcing a new view range."""
+        if hasattr(self, 'plot_curve_1'):
+            for curve in self.plot_curve_1:
+                update_items = getattr(curve, "updateItems", None)
+                if callable(update_items):
+                    update_items()
+                else:
+                    curve.update()
+        plot_item = self.plot_widget_1.getPlotItem()
+        plot_item.update()
+        self.plot_widget_1.getViewBox().update()
+
+    def _tab1_curve_data_range(
+        self,
+        x_values: Optional[np.ndarray] = None,
+        y_values: Optional[list[np.ndarray]] = None,
+    ) -> Optional[tuple[float, float, float, float]]:
+        """Return finite x/y bounds from explicit data or current Plot1 curves."""
+        x_chunks = []
+        y_chunks = []
+
+        if x_values is not None and y_values is not None:
+            x_array = np.asarray(x_values).reshape(-1)
+            for values in y_values:
+                y_array = np.asarray(values).reshape(-1)
+                if x_array.size > 0 and y_array.size > 0:
+                    count = min(x_array.size, y_array.size)
+                    x_chunks.append(x_array[:count])
+                    y_chunks.append(y_array[:count])
+        elif hasattr(self, 'plot_curve_1'):
+            for curve in self.plot_curve_1:
+                x_data, y_data = curve.getData()
+                if x_data is None or y_data is None:
+                    continue
+                x_array = np.asarray(x_data).reshape(-1)
+                y_array = np.asarray(y_data).reshape(-1)
+                if x_array.size > 0 and y_array.size > 0:
+                    count = min(x_array.size, y_array.size)
+                    x_chunks.append(x_array[:count])
+                    y_chunks.append(y_array[:count])
+
+        if not x_chunks or not y_chunks:
+            return None
+
+        x_concat = np.concatenate(x_chunks)
+        y_concat = np.concatenate(y_chunks)
+        mask = np.isfinite(x_concat) & np.isfinite(y_concat)
+        if not np.any(mask):
+            return None
+
+        x_finite = x_concat[mask]
+        y_finite = y_concat[mask]
+        x_min = float(np.min(x_finite))
+        x_max = float(np.max(x_finite))
+        y_min = float(np.min(y_finite))
+        y_max = float(np.max(y_finite))
+        if x_min == x_max:
+            x_min -= 0.5
+            x_max += 0.5
+        if y_min == y_max:
+            y_min -= 0.5
+            y_max += 0.5
+        return x_min, x_max, y_min, y_max
+
+    def _force_tab1_range_to_curve_data(
+        self,
+        x_values: Optional[np.ndarray] = None,
+        y_values: Optional[list[np.ndarray]] = None,
+    ) -> bool:
+        """Force Plot1 range to finite curve data instead of relying on ViewBox cache."""
+        bounds = self._tab1_curve_data_range(x_values, y_values)
+        if bounds is None:
+            return False
+
+        x_min, x_max, y_min, y_max = bounds
+        self._plot_zoom_locked["plot1"] = False
+        view_box = self.plot_widget_1.getViewBox()
+        view_box.enableAutoRange(x=False, y=False)
+        view_box.setRange(
+            xRange=(x_min, x_max),
+            yRange=(y_min, y_max),
+            padding=0.02,
+            disableAutoRange=False,
+        )
+        self._refresh_tab1_curve_items()
+        return True
+
+    def _schedule_tab1_axis_reset_retries(self, axis_kind: str, generation: int) -> None:
+        """Retry Plot1 range restoration after Qt/pyqtgraph finish async item updates."""
+        for delay_ms in (0, 50, 150, 300):
+            QTimer.singleShot(
+                delay_ms,
+                lambda kind=axis_kind, gen=generation: self._retry_tab1_axis_reset(kind, gen),
+            )
+
+    def _retry_tab1_axis_reset(self, axis_kind: str, generation: int) -> None:
+        """Delayed Plot1 range reset guarded by axis kind and generation."""
+        if generation != self._tab1_axis_reset_generation:
+            return
+        if axis_kind != self._tab1_axis_kind_from_label():
+            return
+        if self._plot_zoom_locked.get("plot1", False):
+            return
+        self._force_tab1_range_to_curve_data()
 
     def _setup_plots(self):
         """Initialize plot curves"""
@@ -1590,47 +1716,30 @@ class MainWindow(QMainWindow):
         )
         if axis_changed:
             self._tab1_waveform_x_label = text
+            self._configure_tab1_curves_for_axis(self._tab1_axis_kind_from_label(text))
+            self._clear_waveform_plot()
             self._request_tab1_axis_reset()
 
     def _flush_tab1_axis_reset(self, x_values: np.ndarray, y_values: list[np.ndarray]) -> None:
         """Apply deferred Plot1 range reset using the just-written waveform data."""
-        if not self._tab1_axis_reset_pending:
+        if not self._tab1_axis_reset_pending and self._tab1_axis_reset_frames_remaining <= 0:
             return
-        x_values = np.asarray(x_values)
-        finite_y = [
-            np.asarray(values).reshape(-1)
-            for values in y_values
-            if values is not None and np.asarray(values).size > 0
-        ]
-        if x_values.size == 0 or not finite_y:
+        if self._plot_zoom_locked.get("plot1", False):
+            self._tab1_axis_reset_pending = False
+            self._tab1_axis_reset_frames_remaining = 0
             return
 
-        y_concat = np.concatenate(finite_y)
-        x_finite = x_values[np.isfinite(x_values)]
-        y_finite = y_concat[np.isfinite(y_concat)]
-        if x_finite.size == 0 or y_finite.size == 0:
+        if not self._force_tab1_range_to_curve_data(x_values, y_values):
             return
 
-        self._tab1_axis_reset_pending = False
-        self._plot_zoom_locked["plot1"] = False
-        view_box = self.plot_widget_1.getViewBox()
-        view_box.enableAutoRange(x=False, y=False)
-        x_min = float(np.min(x_finite))
-        x_max = float(np.max(x_finite))
-        y_min = float(np.min(y_finite))
-        y_max = float(np.max(y_finite))
-        if x_min == x_max:
-            x_min -= 0.5
-            x_max += 0.5
-        if y_min == y_max:
-            y_min -= 0.5
-            y_max += 0.5
-        view_box.setRange(
-            xRange=(x_min, x_max),
-            yRange=(y_min, y_max),
-            padding=0.02,
-            disableAutoRange=False,
-        )
+        if self._tab1_axis_reset_pending:
+            self._tab1_axis_reset_pending = False
+            self._schedule_tab1_axis_reset_retries(
+                self._tab1_axis_kind_from_label(),
+                self._tab1_axis_reset_generation,
+            )
+        if self._tab1_axis_reset_frames_remaining > 0:
+            self._tab1_axis_reset_frames_remaining -= 1
 
     def get_tab3_comm_settings(self) -> Dict[str, Any]:
         """Return the current TCP communication settings."""
