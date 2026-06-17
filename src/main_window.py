@@ -1547,6 +1547,37 @@ class MainWindow(QMainWindow):
             params.phase_demod.crop_distance_end,
         )
 
+    def _meters_per_point_for_rate(self, rate_code: int) -> float:
+        """Return distance represented by one unmerged sample for a 6921 rate code."""
+        return {1: 0.4, 2: 0.8, 3: 1.2, 4: 1.6, 5: 2.0}.get(int(rate_code), 0.4)
+
+    def _raw_distance_axis(self, point_count: int) -> np.ndarray:
+        """Return one-based Raw distance axis in meters."""
+        spacing_m = self._meters_per_point_for_rate(self.params.upload.data_rate)
+        return np.arange(1, point_count + 1, dtype=np.float32) * np.float32(spacing_m)
+
+    def _phase_distance_axis(self, point_count: int) -> np.ndarray:
+        """Return one-based PHASE distance axis in meters after spatial merge."""
+        spacing_m = (
+            self._meters_per_point_for_rate(self.params.phase_demod.rate2phase)
+            * max(1, int(self.params.phase_demod.merge_point_num))
+        )
+        return np.arange(1, point_count + 1, dtype=np.float32) * np.float32(spacing_m)
+
+    def _phase_time_axis(self, frame_count: int) -> np.ndarray:
+        """Return one-based PHASE temporal axis in seconds."""
+        scan_rate = max(1, int(self.params.basic.scan_rate))
+        return np.arange(1, frame_count + 1, dtype=np.float32) / np.float32(scan_rate)
+
+    def _set_tab1_waveform_x_label(self, text: str) -> None:
+        """Update Tab1 waveform X-axis label with the standard font style."""
+        self.plot_widget_1.setLabel(
+            'bottom',
+            text,
+            color='k',
+            **{'font-family': 'Times New Roman', 'font-size': '8pt'},
+        )
+
     def get_tab3_comm_settings(self) -> Dict[str, Any]:
         """Return the current TCP communication settings."""
         return {
@@ -2033,6 +2064,8 @@ class MainWindow(QMainWindow):
         log.debug(f"Display mode: {self.params.display.mode}, Region index: {self.params.display.region_index}")
 
         if self.params.display.mode == DisplayMode.SPACE:
+            time_axis = self._phase_time_axis(frame_num)
+            self._set_tab1_waveform_x_label('Time (s)')
             # Space mode: extract single region over time
             region_idx = min(self.params.display.region_index, point_num - 1)
 
@@ -2046,7 +2079,7 @@ class MainWindow(QMainWindow):
 
                 space_data = np.array(space_data)
                 if waveform_enabled:
-                    self.plot_curve_1[0].setData(space_data)
+                    self.plot_curve_1[0].setData(time_axis[:len(space_data)], space_data)
 
                     # Clear other curves
                     for i in range(1, 4):
@@ -2072,7 +2105,7 @@ class MainWindow(QMainWindow):
                     if ch == 0:
                         spectrum_data = space_data
                     if waveform_enabled:
-                        self.plot_curve_1[ch].setData(space_data)
+                        self.plot_curve_1[ch].setData(time_axis[:len(space_data)], space_data)
 
                 if waveform_enabled:
                     for i in range(channel_num, 4):
@@ -2083,13 +2116,15 @@ class MainWindow(QMainWindow):
                                          psd_mode=False, data_type='int')
 
         else:
+            distance_axis = self._phase_distance_axis(point_num)
+            self._set_tab1_waveform_x_label('Distance (m)')
             # Time mode: show multiple frames overlay
             if channel_num == 1:
                 for i in range(min(4, frame_num)):
                     start = i * point_num
                     end = start + point_num
                     if waveform_enabled and end <= len(display_data):
-                        self.plot_curve_1[i].setData(display_data[start:end])
+                        self.plot_curve_1[i].setData(distance_axis, display_data[start:end])
                     elif waveform_enabled:
                         self.plot_curve_1[i].setData([])
 
@@ -2104,7 +2139,7 @@ class MainWindow(QMainWindow):
                 # Show first frame of each channel
                 for ch in range(min(channel_num, 4)):
                     if waveform_enabled and point_num <= len(display_data):
-                        self.plot_curve_1[ch].setData(display_data[:point_num, ch])
+                        self.plot_curve_1[ch].setData(distance_axis, display_data[:point_num, ch])
 
                 # Spectrum: use the newest frame of the first channel.
                 if self.params.display.spectrum_enable and point_num <= len(display_data):
@@ -2151,13 +2186,16 @@ class MainWindow(QMainWindow):
         if frame_num <= 0:
             return
 
+        distance_axis = self._raw_distance_axis(point_num)
+        self._set_tab1_waveform_x_label('Distance (m)')
+
         if channel_num == 1:
             # Show full-resolution frames; pyqtgraph handles view clipping/downsampling.
             for i in range(min(4, frame_num)):
                 start = i * point_num
                 end = start + point_num
                 if waveform_enabled and end <= len(display_data):
-                    self.plot_curve_1[i].setData(display_data[start:end])
+                    self.plot_curve_1[i].setData(distance_axis, display_data[start:end])
                 elif waveform_enabled:
                     self.plot_curve_1[i].setData([])
 
@@ -2172,7 +2210,7 @@ class MainWindow(QMainWindow):
 
             for ch in range(min(channel_num, 4)):
                 if waveform_enabled and point_num <= len(display_data):
-                    self.plot_curve_1[ch].setData(display_data[:point_num, ch])
+                    self.plot_curve_1[ch].setData(distance_axis, display_data[:point_num, ch])
 
             # Spectrum: full-resolution data (Raw data: automatically uses Power Spectrum)
             if self.params.display.spectrum_enable and point_num <= len(display_data):
