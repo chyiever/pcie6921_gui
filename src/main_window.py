@@ -84,6 +84,8 @@ class MainWindow(QMainWindow):
         self.tcp_tab3_manager = TCPTab3Manager()
         self._interactive_plot_widgets: Dict[str, pg.PlotWidget] = {}
         self._plot_zoom_locked: Dict[str, bool] = {}
+        self._tab1_waveform_x_label: Optional[str] = None
+        self._tab1_axis_reset_pending = False
         self._settings_path = self._get_settings_path()
 
         # Parameters
@@ -1095,6 +1097,10 @@ class MainWindow(QMainWindow):
         view_box.enableAutoRange(x=True, y=True)
         view_box.autoRange(padding=0.0)
 
+    def _restore_tab1_auto_range_after_axis_change(self):
+        """Restore Plot1 visibility after switching between distance and time axes."""
+        self._restore_plot_auto_range("plot1")
+
     def _setup_plots(self):
         """Initialize plot curves"""
         # Colors suitable for white background
@@ -1571,12 +1577,25 @@ class MainWindow(QMainWindow):
 
     def _set_tab1_waveform_x_label(self, text: str) -> None:
         """Update Tab1 waveform X-axis label with the standard font style."""
+        axis_changed = self._tab1_waveform_x_label != text
         self.plot_widget_1.setLabel(
             'bottom',
             text,
             color='k',
             **{'font-family': 'Times New Roman', 'font-size': '8pt'},
         )
+        if axis_changed:
+            self._tab1_waveform_x_label = text
+            self._tab1_axis_reset_pending = True
+            self._plot_zoom_locked["plot1"] = False
+            self.plot_widget_1.getViewBox().enableAutoRange(x=True, y=True)
+
+    def _flush_tab1_axis_reset(self) -> None:
+        """Apply deferred Plot1 auto-range reset after new axis data has been set."""
+        if not self._tab1_axis_reset_pending:
+            return
+        self._tab1_axis_reset_pending = False
+        QTimer.singleShot(0, self._restore_tab1_auto_range_after_axis_change)
 
     def get_tab3_comm_settings(self) -> Dict[str, Any]:
         """Return the current TCP communication settings."""
@@ -2114,6 +2133,7 @@ class MainWindow(QMainWindow):
                 if self.params.display.spectrum_enable and spectrum_data is not None and len(spectrum_data) > 0:
                     self._update_spectrum(spectrum_data, self.params.basic.scan_rate,
                                          psd_mode=False, data_type='int')
+            self._flush_tab1_axis_reset()
 
         else:
             distance_axis = self._phase_distance_axis(point_num)
@@ -2145,6 +2165,7 @@ class MainWindow(QMainWindow):
                 if self.params.display.spectrum_enable and point_num <= len(display_data):
                     self._update_spectrum(display_data[-point_num:, 0], self.params.basic.scan_rate,
                                          psd_mode=False, data_type='int')
+            self._flush_tab1_axis_reset()
 
         # Time-Space 图独立于 Mode，由 PLOT 按钮控制。
         # 仅在 Tab2 激活时更新 Time-Space 图，避免干扰 Tab1。
@@ -2218,6 +2239,7 @@ class MainWindow(QMainWindow):
                 # Use first channel for spectrum computation
                 self._update_spectrum(display_data[-point_num:, 0], sample_rate,
                                      psd_mode=False, data_type='short')  # psd_mode ignored for raw data
+        self._flush_tab1_axis_reset()
 
     def _update_monitor_display(self, data: np.ndarray, channel_num: int):
         """Update monitor plot"""

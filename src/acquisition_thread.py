@@ -250,6 +250,20 @@ class AcquisitionThread(QThread):
 
         return np.ascontiguousarray(monitor_data[start:end])
 
+    def _display_points_per_frame(self, data_source: int, channel_num: int) -> int:
+        """Return points per frame after display-side PHASE crop has been applied."""
+        if data_source != DataSource.PHASE:
+            return self._total_point_num
+        if self._params is None or channel_num != 1:
+            return self._point_num_after_merge
+
+        start, end = resolve_phase_crop_bounds(
+            self._point_num_after_merge,
+            self._params.phase_demod.crop_distance_start,
+            self._params.phase_demod.crop_distance_end,
+        )
+        return max(0, end - start)
+
     def run(self):
         """Thread main loop"""
         log.info("=== Acquisition thread started ===")
@@ -551,11 +565,10 @@ class AcquisitionThread(QThread):
 
     def _publish_latest_display_data(self, data: np.ndarray, data_source: int, channel_num: int):
         """Replace the latest display snapshot; unconsumed older snapshots are discarded."""
-        points_per_frame = (
-            self._point_num_after_merge
-            if data_source == DataSource.PHASE
-            else self._total_point_num
-        )
+        points_per_frame = self._display_points_per_frame(data_source, channel_num)
+        if points_per_frame <= 0:
+            log.warning("Skip display snapshot: points_per_frame=%s", points_per_frame)
+            return
         target_frames = max(1, min(self._params.display.frame_plot_num, self._frame_num))
         if channel_num == 1:
             keep_points = min(data.size, points_per_frame * target_frames)
